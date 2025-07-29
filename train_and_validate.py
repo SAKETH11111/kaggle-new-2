@@ -13,14 +13,8 @@ print('Starting FlightRank 2025 training pipeline...')
 """# AeroClub RecSys 2025 - XGBoost Ranking Baseline
 
 This notebook implements an improved ranking approach using XGBoost and Polars for the AeroClub recommendation challenge.
-
-# <div  style="text-align:center;padding:10.0px; background:#000000"> Thank you for your attention! Please upvote if you like it) </div>
+Fixed validation framework with GroupKFold cross-validation to prevent data leakage.
 """
-
-# Commented out IPython magic to ensure Python compatibility.
-# %%capture
-# !pip install -U xgboost
-# !pip install -U polars
 
 import polars as pl
 import numpy as np
