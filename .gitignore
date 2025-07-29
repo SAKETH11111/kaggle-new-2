@@ -27,4 +27,6 @@ hive-mind-prompt-*.txt
 .roo/
 memory/
 CLAUDE.md
+venv/
 .roomodes
+data/
