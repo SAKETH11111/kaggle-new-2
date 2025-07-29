@@ -7,20 +7,8 @@ Original file is located at
     https://colab.research.google.com/#fileId=https%3A//storage.googleapis.com/kaggle-colab-exported-notebooks/sakethbaddam/xgboost-ranker-rule-based-rerank.7a24c721-2245-49ae-aa43-0994f5253753.ipynb%3FX-Goog-Algorithm%3DGOOG4-RSA-SHA256%26X-Goog-Credential%3Dgcp-kaggle-com%2540kaggle-161607.iam.gserviceaccount.com/20250729/auto/storage/goog4_request%26X-Goog-Date%3D20250729T070035Z%26X-Goog-Expires%3D259200%26X-Goog-SignedHeaders%3Dhost%26X-Goog-Signature%3D4b4dcffb0180a5f886e90cd8dd2215e4e6ad5a86026c166f39f80641778b84c47f8a52758f1a558f33f5205d3e5065f9b7ea804c92e2f9c65e62c2371fd17f90e34a94b040d2e5536e779bd9acd2ccad785e90facd030e44716b6e5db6f398c3fabe4e93cd3277ba66c819f163c69029e77f1218912f0e338d9255f4ae930bd91898c5fe7a5755d2f0829c6027e906f7a2a511f9f9aaa9687d5b7adcc323a1011f5e8b5ac8aa3d63e1024b1c8d63a4c607814f3f12c79df20b0d59c1cb0dd29118176779496c8a28bf9107ea0f450bb31feed799d12bee6d355a7d47028716a4246296fcdf1667ca8d4a1399a0aec95b9530223b60def9cb128c05abc90424ba
 """
 
-# IMPORTANT: SOME KAGGLE DATA SOURCES ARE PRIVATE
-# RUN THIS CELL IN ORDER TO IMPORT YOUR KAGGLE DATA SOURCES.
-import kagglehub
-kagglehub.login()
-
-# IMPORTANT: RUN THIS CELL IN ORDER TO IMPORT YOUR KAGGLE DATA SOURCES,
-# THEN FEEL FREE TO DELETE THIS CELL.
-# NOTE: THIS NOTEBOOK ENVIRONMENT DIFFERS FROM KAGGLE'S PYTHON
-# ENVIRONMENT SO THERE MAY BE MISSING LIBRARIES USED BY YOUR
-# NOTEBOOK.
-
-aeroclub_recsys_2025_path = kagglehub.competition_download('aeroclub-recsys-2025')
-
-print('Data source import complete.')
+# FlightRank 2025 - Local Training Script
+print('Starting FlightRank 2025 training pipeline...')
 
 """# AeroClub RecSys 2025 - XGBoost Ranking Baseline
 
