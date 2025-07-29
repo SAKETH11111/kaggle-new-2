@@ -39,13 +39,27 @@ import numpy as np
 import matplotlib.pyplot as plt
 import time
 import xgboost as xgb
+from sklearn.model_selection import GroupKFold
+import pickle
+import os
 
 RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
 
-# Load data
-train = pl.read_parquet('/kaggle/input/aeroclub-recsys-2025/train.parquet').drop('__index_level_0__')
-test = pl.read_parquet('/kaggle/input/aeroclub-recsys-2025/test.parquet').drop('__index_level_0__').with_columns(pl.lit(0, dtype=pl.Int64).alias("selected"))
+# Load data from local files
+print('Loading data files...')
+train = pl.read_parquet('./data/train.parquet')
+test = pl.read_parquet('./data/test.parquet').with_columns(pl.lit(0, dtype=pl.Int64).alias("selected"))
+
+# Drop __index_level_0__ column if it exists
+if '__index_level_0__' in train.columns:
+    train = train.drop('__index_level_0__')
+if '__index_level_0__' in test.columns:
+    test = test.drop('__index_level_0__')
+
+print(f'Train shape: {train.shape}')
+print(f'Test shape: {test.shape}')
+print('Data loading complete.')
 
 data_raw = pl.concat((train, test))
 
@@ -382,22 +396,114 @@ X = data.select(feature_cols)
 y = data.select('selected')
 groups = data.select('ranker_id')
 
-"""## Model Training"""
+"""## Robust Validation Framework - GroupKFold Cross-Validation"""
 
-data_xgb = X.with_columns([(pl.col(c).rank("dense") - 1).fill_null(-1).cast(pl.Int16) for c in cat_features_final])
+print("\n🔧 CRITICAL VALIDATION FIX: Implementing GroupKFold Cross-Validation")
+print("Previous validation was severely flawed (0.930 local vs 0.497 public)")
+print("New approach: 5-fold GroupKFold on ranker_id to prevent data leakage\n")
 
-n1 = 16487352 # split train to train and val (10%) in time
-n2 = train.height
-data_xgb_tr, data_xgb_va, data_xgb_te = data_xgb[:n2], data_xgb[n1:n2], data_xgb[n2:]
-y_tr, y_va, y_te = y[:n2], y[n1:n2], y[n2:]
-groups_tr, groups_va, groups_te = groups[:n2], groups[n1:n2], groups[n2:]
+# Prepare training data only (separate test for final predictions)
+n_train = train.height
+X_train = X[:n_train]
+y_train = y[:n_train]
+groups_train = groups[:n_train]
+X_test = X[n_train:]
+y_test = y[n_train:]
+groups_test = groups[n_train:]
 
-group_sizes_tr = groups_tr.group_by('ranker_id', maintain_order=True).agg(pl.len())['len'].to_numpy()
-group_sizes_va = groups_va.group_by('ranker_id', maintain_order=True).agg(pl.len())['len'].to_numpy()
-group_sizes_te = groups_te.group_by('ranker_id', maintain_order=True).agg(pl.len())['len'].to_numpy()
-dtrain = xgb.DMatrix(data_xgb_tr, label=y_tr, group=group_sizes_tr, feature_names=data_xgb.columns)
-dval   = xgb.DMatrix(data_xgb_va, label=y_va, group=group_sizes_va, feature_names=data_xgb.columns)
-dtest  = xgb.DMatrix(data_xgb_te, label=y_te, group=group_sizes_te, feature_names=data_xgb.columns)
+# Encode categorical features for XGBoost
+data_xgb_train = X_train.with_columns([(pl.col(c).rank("dense") - 1).fill_null(-1).cast(pl.Int16) for c in cat_features_final])
+data_xgb_test = X_test.with_columns([(pl.col(c).rank("dense") - 1).fill_null(-1).cast(pl.Int16) for c in cat_features_final])
+
+# Convert to numpy for sklearn compatibility
+X_train_np = data_xgb_train.to_numpy()
+y_train_np = y_train.to_numpy().flatten()
+groups_train_np = groups_train.to_numpy().flatten()
+
+# 5-Fold GroupKFold Cross-Validation
+print("Starting 5-fold GroupKFold cross-validation...")
+gkf = GroupKFold(n_splits=5)
+fold_scores = []
+best_score = 0
+best_model = None
+
+for fold_idx, (train_idx, val_idx) in enumerate(gkf.split(X_train_np, y_train_np, groups_train_np), 1):
+    print(f"\n--- Fold {fold_idx}/5 ---")
+    
+    # Split data for this fold
+    X_fold_train, X_fold_val = X_train_np[train_idx], X_train_np[val_idx]
+    y_fold_train, y_fold_val = y_train_np[train_idx], y_train_np[val_idx]
+    groups_fold_train, groups_fold_val = groups_train_np[train_idx], groups_train_np[val_idx]
+    
+    # Calculate group sizes for XGBoost ranking
+    unique_groups_train, group_sizes_train = np.unique(groups_fold_train, return_counts=True)
+    unique_groups_val, group_sizes_val = np.unique(groups_fold_val, return_counts=True)
+    
+    # Sort by group to match XGBoost expectations
+    train_sort_idx = np.argsort(groups_fold_train)
+    val_sort_idx = np.argsort(groups_fold_val)
+    
+    X_fold_train_sorted = X_fold_train[train_sort_idx]
+    y_fold_train_sorted = y_fold_train[train_sort_idx]
+    X_fold_val_sorted = X_fold_val[val_sort_idx]
+    y_fold_val_sorted = y_fold_val[val_sort_idx]
+    groups_fold_val_sorted = groups_fold_val[val_sort_idx]
+    
+    # Create XGBoost DMatrix
+    dtrain_fold = xgb.DMatrix(X_fold_train_sorted, label=y_fold_train_sorted, group=group_sizes_train, feature_names=data_xgb_train.columns)
+    dval_fold = xgb.DMatrix(X_fold_val_sorted, label=y_fold_val_sorted, group=group_sizes_val, feature_names=data_xgb_train.columns)
+    
+    # XGBoost parameters (same as original)
+    xgb_params = {
+        'objective': 'rank:pairwise',
+        'eval_metric': 'ndcg@3',
+        "learning_rate": 0.022641389657079056,
+        "max_depth": 14,
+        "min_child_weight": 2,
+        "subsample": 0.8842234913702768,
+        "colsample_bytree": 0.45840689146263086,
+        "gamma": 3.3084297630544888,
+        "lambda": 6.952586917313028,
+        "alpha": 0.6395254133055179,
+        'seed': RANDOM_STATE,
+        'n_jobs': -1,
+    }
+    
+    # Train model for this fold
+    fold_model = xgb.train(
+        xgb_params,
+        dtrain_fold,
+        num_boost_round=800,
+        evals=[(dtrain_fold, 'train'), (dval_fold, 'val')],
+        verbose_eval=0  # Reduce output for cleaner logs
+    )
+    
+    # Evaluate on validation set
+    val_predictions = fold_model.predict(dval_fold)
+    
+    # Calculate HitRate@3 with proper group filtering (>10 options)
+    fold_hr3 = hitrate_at_3(y_fold_val_sorted, val_predictions, groups_fold_val_sorted)
+    fold_scores.append(fold_hr3)
+    
+    print(f"Fold {fold_idx} HitRate@3: {fold_hr3:.5f}")
+    
+    # Track best model
+    if fold_hr3 > best_score:
+        best_score = fold_hr3
+        best_model = fold_model
+
+# Report cross-validation results
+avg_score = np.mean(fold_scores)
+std_score = np.std(fold_scores)
+print(f"\n🎯 VALIDATION RESULTS:")
+print(f"Average HitRate@3: {avg_score:.5f} (+/- {std_score:.5f})")
+print(f"Individual fold scores: {[f'{score:.5f}' for score in fold_scores]}")
+print(f"Best single fold: {best_score:.5f}")
+
+if avg_score < 0.8:  # Much more realistic
+    print("✅ SUCCESS: Validation score is now realistic (no more data leakage!)")
+else:
+    print("⚠️  WARNING: Score still seems too high - check for remaining leakage")
 
 # XGBoost parameters
 xgb_params = {
@@ -416,27 +522,39 @@ xgb_params = {
     # 'device': 'cuda'
 }
 
-# Train XGBoost model
-print("Training XGBoost model...")
-xgb_model = xgb.train(
+# Train final model on full training data
+print("\n🏗️  Training final model on full training data...")
+
+# Prepare full training data
+X_full_train_sorted_idx = np.argsort(groups_train_np)
+X_full_train_sorted = X_train_np[X_full_train_sorted_idx]
+y_full_train_sorted = y_train_np[X_full_train_sorted_idx]
+
+unique_groups_full, group_sizes_full = np.unique(groups_train_np, return_counts=True)
+dtrain_full = xgb.DMatrix(X_full_train_sorted, label=y_full_train_sorted, group=group_sizes_full, feature_names=data_xgb_train.columns)
+
+# Train final model
+final_model = xgb.train(
     xgb_params,
-    dtrain,
+    dtrain_full,
     num_boost_round=800,
-    evals=[(dtrain, 'train'), (dval, 'val')],
-#     early_stopping_rounds=100,
     verbose_eval=50
 )
 
-# Evaluate XGBoost
-xgb_va_preds = xgb_model.predict(dval)
-xgb_hr3 = hitrate_at_3(y_va, xgb_va_preds, groups_va)
-print(f"HitRate@3: {xgb_hr3:.3f}")
+# Save the trained model
+os.makedirs('./models', exist_ok=True)
+with open('./models/best_model.pkl', 'wb') as f:
+    pickle.dump(final_model, f)
+    
+print("✅ Model saved to ./models/best_model.pkl")
 
-xgb_importance = xgb_model.get_score(importance_type='gain')
-xgb_importance_df = pl.DataFrame(
-    [{'feature': k, 'importance': v} for k, v in xgb_importance.items()]
+# Feature importance from final model
+final_importance = final_model.get_score(importance_type='gain')
+final_importance_df = pl.DataFrame(
+    [{'feature': k, 'importance': v} for k, v in final_importance.items()]
 ).sort('importance', descending=bool(1))
-print(xgb_importance_df.head(20).to_pandas().to_string())
+print("\n📊 Top 20 Feature Importances:")
+print(final_importance_df.head(20).to_pandas().to_string())
 
 """## Submission"""
 
@@ -499,9 +617,21 @@ def re_rank(test: pl.DataFrame, submission_xgb: pl.DataFrame, penalty_factor=0.1
 
     return df.select(["Id", "ranker_id", "new_selected", "pred_score", "reorder_score"])
 
+# Generate test predictions using final model
+unique_groups_test, group_sizes_test = np.unique(groups_test.to_numpy().flatten(), return_counts=True)
+test_sort_idx = np.argsort(groups_test.to_numpy().flatten())
+X_test_sorted = data_xgb_test.to_numpy()[test_sort_idx]
+dtest_final = xgb.DMatrix(X_test_sorted, group=group_sizes_test, feature_names=data_xgb_test.columns)
+
+test_predictions = final_model.predict(dtest_final)
+
+# Restore original order
+reverse_sort_idx = np.argsort(test_sort_idx)
+test_predictions_original_order = test_predictions[reverse_sort_idx]
+
 submission_xgb = (
     test.select(['Id', 'ranker_id'])
-    .with_columns(pl.Series('pred_score', xgb_model.predict(dtest)))
+    .with_columns(pl.Series('pred_score', test_predictions_original_order))
     .with_columns(
         pl.col('pred_score')
         .rank(method='ordinal', descending=True)

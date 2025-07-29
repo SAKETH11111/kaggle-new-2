@@ -30,3 +30,5 @@ CLAUDE.md
 venv/
 .roomodes
 data/
+submission.csv
+*.csv

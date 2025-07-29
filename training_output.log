@@ -1,45 +1,4 @@
-Loading local data files...
-Train shape: (18145372, 126)
-Test shape: (6897776, 126)
-Data loading complete.
-Using 90 features (20 categorical)
-Training XGBoost model...
-[0]	train-ndcg@3:0.35392	val-ndcg@3:0.38733
-[50]	train-ndcg@3:0.60111	val-ndcg@3:0.64494
-[100]	train-ndcg@3:0.64445	val-ndcg@3:0.68682
-[150]	train-ndcg@3:0.67534	val-ndcg@3:0.71413
-[200]	train-ndcg@3:0.70009	val-ndcg@3:0.73449
-[250]	train-ndcg@3:0.72054	val-ndcg@3:0.75347
-[300]	train-ndcg@3:0.74275	val-ndcg@3:0.77315
-[350]	train-ndcg@3:0.76149	val-ndcg@3:0.78866
-[400]	train-ndcg@3:0.78187	val-ndcg@3:0.80659
-[450]	train-ndcg@3:0.79695	val-ndcg@3:0.82128
-[500]	train-ndcg@3:0.81129	val-ndcg@3:0.83517
-[550]	train-ndcg@3:0.82340	val-ndcg@3:0.84539
-[600]	train-ndcg@3:0.83492	val-ndcg@3:0.85614
-[650]	train-ndcg@3:0.84345	val-ndcg@3:0.86438
-[700]	train-ndcg@3:0.85035	val-ndcg@3:0.87081
-[750]	train-ndcg@3:0.85637	val-ndcg@3:0.87526
-[799]	train-ndcg@3:0.86239	val-ndcg@3:0.88061
-HitRate@3: 0.930
-                                                   feature   importance
-0                                          is_min_segments  4305.547363
-1                                            free_exchange   129.701584
-2                                                   l0_seg    69.798439
-3                                              free_cancel    58.320797
-4                                   pricingInfo_isAccessTP    58.265675
-5                                         is_major_carrier    54.232174
-6                                            has_access_tp    46.427727
-7                                           total_segments    42.112720
-8                               legs0_segments0_cabinClass    40.210163
-9                                          avg_cabin_class    32.653801
-10               legs0_segments0_baggageAllowance_quantity    30.905916
-11                                          legs0_duration    30.069876
-12  legs0_segments0_baggageAllowance_weightMeasurementType    29.907408
-13                               miniRules1_monetaryAmount    26.191696
-14                                        is_popular_route    24.655058
-15                                  miniRules1_statusInfos    23.046555
-16  legs1_segments0_baggageAllowance_weightMeasurementType    22.930258
-17                                legs0_segments1_duration    21.885454
-18                                                   isVip    19.890211
-19                                           duration_rank    18.038969
+Traceback (most recent call last):
+  File "/home/saketh/kaggle/train_and_validate.py", line 12, in <module>
+    import kagglehub
+ModuleNotFoundError: No module named 'kagglehub'
