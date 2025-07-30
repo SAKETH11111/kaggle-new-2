@@ -32,3 +32,4 @@ venv/
 data/
 submission.csv
 *.csv
+models/
