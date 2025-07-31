@@ -33,3 +33,6 @@ data/
 submission.csv
 *.csv
 models/
+.claude-flow/
+catboost_info/
+checkpoints/

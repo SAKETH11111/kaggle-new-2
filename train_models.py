@@ -25,8 +25,18 @@ from sklearn.model_selection import GroupKFold
 import os
 import pickle
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from abc import ABC, abstractmethod
+import logging
+from tqdm import tqdm
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
@@ -42,7 +52,7 @@ USE_SUBSET = False  # Use 100% of training data for final model
 SUBSET_FRACTION = 1.0
 N_FOLDS = 5
 
-print('Loading local data files...')
+logger.info('Loading local data files...')
 
 # Load data from local files
 train = pl.read_parquet('./data/train.parquet')
@@ -50,12 +60,12 @@ test = pl.read_parquet('./data/test.parquet').with_columns(pl.lit(0, dtype=pl.In
 
 # USE SUBSET FOR TESTING
 if USE_SUBSET:
-    print(f"Using {SUBSET_FRACTION*100}% of training data for testing...")
+    logger.info(f"Using {SUBSET_FRACTION*100}% of training data for testing...")
     n_subset = int(len(train) * SUBSET_FRACTION)
     train = train[:n_subset]
-    print(f"Training data reduced to {len(train)} rows")
+    logger.info(f"Training data reduced to {len(train)} rows")
 else:
-    print("🚀 Using 100% of training data for final model!")
+    logger.info("🚀 Using 100% of training data for final model!")
 
 # Drop __index_level_0__ column if it exists
 if '__index_level_0__' in train.columns:
@@ -63,9 +73,9 @@ if '__index_level_0__' in train.columns:
 if '__index_level_0__' in test.columns:
     test = test.drop('__index_level_0__')
 
-print(f'Train shape: {train.shape}')
-print(f'Test shape: {test.shape}')
-print('Data loading complete.')
+logger.info(f'Train shape: {train.shape}')
+logger.info(f'Test shape: {test.shape}')
+logger.info('Data loading complete.')
 
 data_raw = pl.concat((train, test))
 
@@ -372,7 +382,7 @@ for leg in [0, 1]:
 feature_cols = [col for col in data.columns if col not in exclude_cols]
 cat_features_final = [col for col in cat_features if col in feature_cols]
 
-print(f"Using {len(feature_cols)} features ({len(cat_features_final)} categorical)")
+logger.info(f"Using {len(feature_cols)} features ({len(cat_features_final)} categorical)")
 
 X = data.select(feature_cols)
 y = data.select('selected')
@@ -445,12 +455,14 @@ class XGBoostTrainer(ModelTrainer):
         
         # Train model
         rounds = 400 if USE_SUBSET else 600
+        callbacks = [xgb.callback.EvaluationMonitor(show_stdv=False, period=50)]
         self.model = xgb.train(
             self.get_params(),
             dtrain,
             num_boost_round=rounds,
             evals=evals,
-            verbose_eval=0
+            verbose_eval=False,
+            callbacks=callbacks
         )
         return self
     
@@ -504,7 +516,8 @@ class LightGBMTrainer(ModelTrainer):
             X_train.to_numpy(), 
             label=y_train.to_numpy().flatten(),
             group=group_sizes_train,
-            feature_name=list(X_train.columns)
+            feature_name=list(X_train.columns),
+            categorical_feature='auto'  # Let LightGBM auto-detect categorical features
         )
         
         valid_sets = [dtrain]
@@ -517,6 +530,7 @@ class LightGBMTrainer(ModelTrainer):
                 label=y_val.to_numpy().flatten(),
                 group=group_sizes_val,
                 feature_name=list(X_val.columns),
+                categorical_feature='auto',
                 reference=dtrain
             )
             valid_sets.append(dval)
@@ -528,7 +542,7 @@ class LightGBMTrainer(ModelTrainer):
             dtrain,
             valid_sets=valid_sets,
             valid_names=valid_names,
-            callbacks=[lgb.log_evaluation(0)]  # Suppress output
+            callbacks=[lgb.log_evaluation(50)]  # Show progress every 50 iterations
         )
         return self
     
@@ -584,7 +598,7 @@ class CatBoostTrainer(ModelTrainer):
         
         # Train model
         self.model = cb.CatBoost(self.get_params())
-        self.model.fit(train_pool, eval_set=eval_pool, verbose=False)
+        self.model.fit(train_pool, eval_set=eval_pool, verbose=50)
         return self
     
     def predict(self, X):
@@ -618,13 +632,20 @@ def cross_validate_model(X, y, groups, model_trainer, n_folds=N_FOLDS):
     1. Uses GroupKFold with ranker_id to prevent data leakage
     2. Applies >10 options filter BEFORE calculating HitRate@3 
     3. Returns realistic CV scores that should match public LB
+    4. SAVES CHECKPOINTS AFTER EACH FOLD for spot instance resilience
     """
     
-    # Prepare data - handle categorical features for XGBoost
+    # Prepare data - handle categorical features
     if model_trainer.model_type == 'xgboost':
+        # XGBoost needs integer encoding
         data_processed = X.with_columns([(pl.col(c).rank("dense") - 1).fill_null(-1).cast(pl.Int16) for c in cat_features_final])
+    elif model_trainer.model_type == 'lightgbm':
+        # LightGBM also needs integer encoding for string categoricals
+        data_processed = X.with_columns([(pl.col(c).rank("dense") - 1).fill_null(-1).cast(pl.Int32) for c in cat_features_final])
+    elif model_trainer.model_type == 'catboost':
+        # CatBoost also needs integer encoding for string categoricals
+        data_processed = X.with_columns([(pl.col(c).rank("dense") - 1).fill_null(-1).cast(pl.Int32) for c in cat_features_final])
     else:
-        # LightGBM and CatBoost can handle categoricals directly
         data_processed = X
     
     # Extract training data only
@@ -633,17 +654,42 @@ def cross_validate_model(X, y, groups, model_trainer, n_folds=N_FOLDS):
     y_train = y[:n_train]
     groups_train = groups[:n_train]
     
-    print(f"\nStarting {n_folds}-fold GroupKFold cross-validation for {model_trainer.model_type.upper()}...")
-    print(f"Training data: {len(X_train)} rows, {len(groups_train.unique('ranker_id'))} unique ranker_ids")
+    # Create checkpoint directory
+    os.makedirs('./checkpoints', exist_ok=True)
+    checkpoint_file = f'./checkpoints/{model_trainer.model_type}_cv_checkpoint.pkl'
+    
+    # Check if we have an existing checkpoint
+    start_fold = 0
+    fold_scores = []
+    
+    if os.path.exists(checkpoint_file):
+        logger.info(f"🔄 Found checkpoint for {model_trainer.model_type}, resuming from saved state...")
+        with open(checkpoint_file, 'rb') as f:
+            checkpoint = pickle.load(f)
+            fold_scores = checkpoint['fold_scores']
+            start_fold = checkpoint['next_fold']
+            logger.info(f"✅ Resuming from fold {start_fold + 1}, completed folds: {len(fold_scores)}")
+            logger.info(f"✅ Scores so far: {[f'{score:.5f}' for score in fold_scores]}")
+    
+    logger.info(f"\nStarting {n_folds}-fold GroupKFold cross-validation for {model_trainer.model_type.upper()}...")
+    logger.info(f"Training data: {len(X_train)} rows, {len(groups_train.unique('ranker_id'))} unique ranker_ids")
+    
+    # Start timing for the entire CV
+    cv_start_time = time.time()
     
     # CRITICAL: Use GroupKFold with ranker_id to prevent leakage
     gkf = GroupKFold(n_splits=n_folds)
     groups_array = groups_train.to_pandas()['ranker_id'].values
     
-    fold_scores = []
-    
     for fold, (train_idx, val_idx) in enumerate(gkf.split(X_train, y_train, groups_array)):
-        print(f"\nFold {fold + 1}/{n_folds}:")
+        # Skip already completed folds
+        if fold < start_fold:
+            continue
+        
+        fold_start_time = time.time()
+        logger.info(f"\n{'='*60}")
+        logger.info(f"FOLD {fold + 1}/{n_folds}")
+        logger.info(f"{'='*60}")
         
         # Split data
         X_fold_train = X_train[train_idx]
@@ -654,16 +700,21 @@ def cross_validate_model(X, y, groups, model_trainer, n_folds=N_FOLDS):
         y_fold_val = y_train[val_idx]
         groups_fold_val = groups_train[val_idx]
         
-        print(f"  Train: {len(X_fold_train)} rows, {len(groups_fold_train.unique('ranker_id'))} groups")
-        print(f"  Val:   {len(X_fold_val)} rows, {len(groups_fold_val.unique('ranker_id'))} groups")
+        logger.info(f"Train: {len(X_fold_train):,} rows, {len(groups_fold_train.unique('ranker_id')):,} groups")
+        logger.info(f"Val:   {len(X_fold_val):,} rows, {len(groups_fold_val.unique('ranker_id')):,} groups")
         
         # Train model using the trainer's train method
-        print(f"  Training {model_trainer.model_type}...")
+        logger.info(f"\n⏱️  Starting {model_trainer.model_type} training for fold {fold + 1}...")
+        train_start = time.time()
+        
         trainer = get_model_trainer(model_trainer.model_type)  # Create fresh trainer for each fold
         trainer.train(
             X_fold_train, y_fold_train, groups_fold_train,
             X_fold_val, y_fold_val, groups_fold_val
         )
+        
+        train_duration = time.time() - train_start
+        logger.info(f"✅ Training completed in {train_duration/60:.1f} minutes")
         
         # Make predictions based on model type
         if model_trainer.model_type == 'xgboost':
@@ -685,16 +736,52 @@ def cross_validate_model(X, y, groups, model_trainer, n_folds=N_FOLDS):
         )
         
         fold_scores.append(fold_score)
-        print(f"  Fold {fold + 1} HitRate@3: {fold_score:.5f}")
+        
+        fold_duration = time.time() - fold_start_time
+        logger.info(f"\n📊 Fold {fold + 1} Results:")
+        logger.info(f"   HitRate@3: {fold_score:.5f}")
+        logger.info(f"   Time: {fold_duration/60:.1f} minutes")
+        
+        # Estimate remaining time
+        elapsed_time = time.time() - cv_start_time
+        avg_fold_time = elapsed_time / (fold - start_fold + 1)
+        remaining_folds = n_folds - fold - 1
+        est_remaining = avg_fold_time * remaining_folds / 60
+        
+        if remaining_folds > 0:
+            logger.info(f"   Estimated time remaining for CV: {est_remaining:.1f} minutes")
+        
+        # SAVE CHECKPOINT AFTER EACH FOLD
+        checkpoint = {
+            'fold_scores': fold_scores,
+            'next_fold': fold + 1,  # Next fold to process
+            'n_folds': n_folds,
+            'model_type': model_trainer.model_type,
+            'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S")
+        }
+        
+        with open(checkpoint_file, 'wb') as f:
+            pickle.dump(checkpoint, f)
+        logger.info(f"💾 Checkpoint saved! Can resume from fold {fold + 2} if interrupted.")
+    
+    # Delete checkpoint file after successful completion
+    if os.path.exists(checkpoint_file):
+        os.remove(checkpoint_file)
+        logger.info(f"✅ CV completed successfully, checkpoint removed.")
     
     cv_mean = np.mean(fold_scores)
     cv_std = np.std(fold_scores)
     
-    print(f"\n" + "="*50)
-    print(f"{model_trainer.model_type.upper()} CROSS-VALIDATION RESULTS:")
-    print(f"Mean HitRate@3: {cv_mean:.5f} ± {cv_std:.5f}")
-    print(f"Individual folds: {[f'{score:.5f}' for score in fold_scores]}")
-    print(f"="*50)
+    cv_total_time = time.time() - cv_start_time
+    
+    logger.info(f"\n{'='*60}")
+    logger.info(f"{model_trainer.model_type.upper()} CROSS-VALIDATION RESULTS")
+    logger.info(f"{'='*60}")
+    logger.info(f"Mean HitRate@3: {cv_mean:.5f} ± {cv_std:.5f}")
+    logger.info(f"Individual folds: {[f'{score:.5f}' for score in fold_scores]}")
+    logger.info(f"Total CV time: {cv_total_time/60:.1f} minutes")
+    logger.info(f"Average time per fold: {cv_total_time/n_folds/60:.1f} minutes")
+    logger.info(f"{'='*60}")
     
     return cv_mean, cv_std, fold_scores
 
@@ -707,12 +794,30 @@ else:
 # Store results for all models
 all_results = {}
 
+# Check for overall progress file
+progress_file = './checkpoints/training_progress.pkl'
+completed_models = set()
+
+if os.path.exists(progress_file):
+    logger.info("🔄 Found overall progress file, checking completed models...")
+    with open(progress_file, 'rb') as f:
+        progress = pickle.load(f)
+        completed_models = set(progress.get('completed_models', []))
+        all_results = progress.get('results', {})
+    logger.info(f"✅ Already completed: {', '.join(completed_models) if completed_models else 'None'}")
+
 """## TRAINING AND VALIDATION FOR SELECTED MODELS"""
 
 for model_type in models_to_train:
-    print(f"\n" + "="*70)
-    print(f"PROCESSING {model_type.upper()} MODEL")
-    print("="*70)
+    # Skip if already completed
+    if model_type in completed_models:
+        logger.info(f"\n⏭️  Skipping {model_type} - already completed!")
+        continue
+    
+    model_start_time = time.time()
+    logger.info(f"\n{'='*70}")
+    logger.info(f"PROCESSING {model_type.upper()} MODEL")
+    logger.info(f"{'='*70}")
     
     # Get the appropriate trainer
     trainer = get_model_trainer(model_type)
@@ -727,13 +832,17 @@ for model_type in models_to_train:
         'fold_scores': fold_scores
     }
     
-    print(f"\n" + "="*50)
-    print(f"TRAINING FINAL {model_type.upper()} MODEL")
-    print("="*50)
+    logger.info(f"\n{'='*50}")
+    logger.info(f"TRAINING FINAL {model_type.upper()} MODEL")
+    logger.info(f"{'='*50}")
     
     # Prepare final training data
     if model_type == 'xgboost':
         data_final = X.with_columns([(pl.col(c).rank("dense") - 1).fill_null(-1).cast(pl.Int16) for c in cat_features_final])
+    elif model_type == 'lightgbm':
+        data_final = X.with_columns([(pl.col(c).rank("dense") - 1).fill_null(-1).cast(pl.Int32) for c in cat_features_final])
+    elif model_type == 'catboost':
+        data_final = X.with_columns([(pl.col(c).rank("dense") - 1).fill_null(-1).cast(pl.Int32) for c in cat_features_final])
     else:
         data_final = X
     
@@ -742,12 +851,17 @@ for model_type in models_to_train:
     y_final = y[:train.height]
     groups_final = groups[:train.height]
     
-    print(f"Final training: {len(X_final)} rows, {len(groups_final.unique('ranker_id'))} unique groups")
+    logger.info(f"Final training: {len(X_final):,} rows, {len(groups_final.unique('ranker_id')):,} unique groups")
     
     # Train final model on 100% of data
-    print(f"Training final {model_type} model on 100% of data...")
+    logger.info(f"Training final {model_type} model on 100% of data...")
+    final_train_start = time.time()
+    
     final_trainer = get_model_trainer(model_type)
     final_trainer.train(X_final, y_final, groups_final)
+    
+    final_train_time = time.time() - final_train_start
+    logger.info(f"✅ Final model trained in {final_train_time/60:.1f} minutes")
     
     # Create models directory if it doesn't exist
     os.makedirs('./models', exist_ok=True)
@@ -763,7 +877,7 @@ for model_type in models_to_train:
     model_filename = f'./models/{model_type}_ranker_cv_{cv_mean:.5f}_{timestamp}.{model_extension}'
     final_trainer.save_model(model_filename)
     
-    print(f"✅ Model saved to: {model_filename}")
+    logger.info(f"✅ Model saved to: {model_filename}")
     
     # Save model info
     model_info = {
@@ -783,30 +897,48 @@ for model_type in models_to_train:
     with open(info_filename, 'wb') as f:
         pickle.dump(model_info, f)
     
-    print(f"✅ Model info saved to: {info_filename}")
+    logger.info(f"✅ Model info saved to: {info_filename}")
     
     # Store the model path for the final report
     all_results[model_type]['model_path'] = model_filename
     all_results[model_type]['info_path'] = info_filename
+    
+    # Mark this model as completed and save progress
+    completed_models.add(model_type)
+    progress = {
+        'completed_models': list(completed_models),
+        'results': all_results,
+        'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S")
+    }
+    
+    os.makedirs('./checkpoints', exist_ok=True)
+    with open(progress_file, 'wb') as f:
+        pickle.dump(progress, f)
+    
+    model_total_time = time.time() - model_start_time
+    logger.info(f"✅ {model_type} completed in {model_total_time/60:.1f} minutes total!")
+    logger.info(f"✅ Progress saved - can safely interrupt now.")
 
 """## FINAL REPORT"""
 
-print(f"\n" + "="*70)
-print("MULTI-MODEL TRAINING COMPLETED SUCCESSFULLY! 🎯")
-print("="*70)
-print(f"Models trained: {', '.join(models_to_train)}")
-print(f"\nCROSS-VALIDATION RESULTS (5-fold GroupKFold with HitRate@3):")
-print("-"*50)
+logger.info(f"\n{'='*70}")
+logger.info("MULTI-MODEL TRAINING COMPLETED SUCCESSFULLY! 🎯")
+logger.info(f"{'='*70}")
+logger.info(f"Models trained: {', '.join([m for m in models_to_train if m in all_results])}")
+logger.info(f"\nCROSS-VALIDATION RESULTS ({N_FOLDS}-fold GroupKFold with HitRate@3):")
+logger.info("-"*50)
 
 for model_type in models_to_train:
-    result = all_results[model_type]
-    print(f"\n{model_type.upper()}:")
-    print(f"  Mean CV Score: {result['cv_mean']:.5f} ± {result['cv_std']:.5f}")
-    print(f"  Individual folds: {[f'{score:.5f}' for score in result['fold_scores']]}")
-    print(f"  Model saved to: {result['model_path']}")
+    if model_type in all_results:
+        result = all_results[model_type]
+        logger.info(f"\n{model_type.upper()}:")
+        logger.info(f"  Mean CV Score: {result['cv_mean']:.5f} ± {result['cv_std']:.5f}")
+        logger.info(f"  Individual folds: {[f'{score:.5f}' for score in result['fold_scores']]}")
+        logger.info(f"  Model saved to: {result['model_path']}")
 
-print("\n" + "="*70)
-print("✅ All models trained with GroupKFold (no data leakage)")
-print("✅ HitRate@3 calculated with >10 options filter")
-print("✅ Models saved to ./models/ directory")
-print("="*70)
+logger.info("\n" + "="*70)
+logger.info("✅ All models trained with GroupKFold (no data leakage)")
+logger.info("✅ HitRate@3 calculated with >10 options filter")
+logger.info("✅ Models saved to ./models/ directory")
+logger.info("✅ Checkpoints saved to ./checkpoints/ directory")
+logger.info("="*70)
