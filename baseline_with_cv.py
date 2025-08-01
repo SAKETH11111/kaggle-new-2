@@ -19,6 +19,8 @@ from sklearn.model_selection import GroupKFold
 import os
 import pickle
 from datetime import datetime
+from tqdm import tqdm
+import json
 
 RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
@@ -126,9 +128,32 @@ df = df.with_columns([
         (pl.sum_horizontal(pl.col(col).is_not_null().cast(pl.UInt8) for col in mc_exists)
          if mc_exists else pl.lit(0)).alias("l0_seg"),
 
+        # ADVANCED FEATURE 1: Booking lead time in hours
+        (
+            pl.col("legs0_departureAt").str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S") - 
+            pl.col("requestDate")
+        ).dt.total_hours().alias("booking_lead_time_hours"),
+
+        # ADVANCED FEATURE 2: Overnight flight indicator
+        (
+            pl.col("legs0_departureAt").str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S").dt.date() !=
+            pl.col("legs0_arrivalAt").str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S").dt.date()
+        ).cast(pl.Int32).alias("is_overnight_flight"),
+
         # FF features
         (pl.col("frequentFlyer").fill_null("").str.count_matches("/") +
          (pl.col("frequentFlyer").fill_null("") != "").cast(pl.Int32)).alias("n_ff_programs"),
+
+        # ADVANCED FEATURE 4: Loyalty match (airline codes in FF matching marketing carrier)
+        pl.when(pl.col("frequentFlyer").is_not_null() & (pl.col("frequentFlyer") != ""))
+        .then(
+            pl.col("frequentFlyer").str.contains(
+                pl.col("legs0_segments0_marketingCarrier_code").fill_null("")
+            ).fill_null(False)
+        )
+        .otherwise(False)
+        .cast(pl.Int32)
+        .alias("loyalty_match"),
 
         # Binary features
         pl.col("corporateTariffCode").is_not_null().cast(pl.Int32).alias("has_corporate_tariff"),
@@ -254,9 +279,16 @@ df = (
         on='legs1_segments0_marketingCarrier_code',
         how='left'
     )
+    .join(
+        # ADVANCED FEATURE 3: Corporate route frequency
+        train.group_by(['companyID', 'searchRoute']).agg(pl.len().alias('corporate_route_frequency')),
+        on=['companyID', 'searchRoute'],
+        how='left'
+    )
     .with_columns([
         pl.col('carrier0_pop').fill_null(0.0),
         pl.col('carrier1_pop').fill_null(0.0),
+        pl.col('corporate_route_frequency').fill_null(1),  # Default to 1 for unseen company-route pairs
     ])
 )
 
@@ -372,11 +404,32 @@ print("="*60)
 
 def cross_validate_xgboost(X, y, groups, n_folds=N_FOLDS):
     """
-    CORRECTED Cross-validation that properly mimics competition evaluation:
+    ENHANCED Cross-validation with progress bars and checkpoint saving:
     1. Uses GroupKFold with ranker_id to prevent data leakage
     2. Applies >10 options filter BEFORE calculating HitRate@3 
-    3. Returns realistic CV scores that should match public LB
+    3. Progress bars for fold and training iterations
+    4. Checkpoint saving for resuming interrupted training
     """
+    
+    # Create checkpoint directory
+    os.makedirs('./checkpoints', exist_ok=True)
+    checkpoint_file = './checkpoints/cv_checkpoint.json'
+    
+    # Check for existing checkpoint
+    completed_folds = []
+    fold_scores = []
+    start_fold = 0
+    
+    if os.path.exists(checkpoint_file):
+        print("🔄 Found existing checkpoint, resuming training...")
+        with open(checkpoint_file, 'r') as f:
+            checkpoint = json.load(f)
+            completed_folds = checkpoint.get('completed_folds', [])
+            fold_scores = checkpoint.get('fold_scores', [])
+            start_fold = len(fold_scores)
+            if start_fold > 0:
+                print(f"   Resuming from fold {start_fold + 1}/{n_folds}")
+                print(f"   Completed folds scores: {[f'{score:.5f}' for score in fold_scores]}")
     
     # Prepare data for XGBoost
     data_xgb = X.with_columns([(pl.col(c).rank("dense") - 1).fill_null(-1).cast(pl.Int16) for c in cat_features_final])
@@ -387,14 +440,12 @@ def cross_validate_xgboost(X, y, groups, n_folds=N_FOLDS):
     y_train = y[:n_train]
     groups_train = groups[:n_train]
     
-    print(f"Starting {n_folds}-fold GroupKFold cross-validation...")
-    print(f"Training data: {len(X_train)} rows, {len(groups_train.unique('ranker_id'))} unique ranker_ids")
+    print(f"🚀 Starting {n_folds}-fold GroupKFold cross-validation with ENHANCED FEATURES...")
+    print(f"📊 Training data: {len(X_train)} rows, {len(groups_train.unique('ranker_id'))} unique ranker_ids")
     
     # CRITICAL: Use GroupKFold with ranker_id to prevent leakage
     gkf = GroupKFold(n_splits=n_folds)
     groups_array = groups_train.to_pandas()['ranker_id'].values
-    
-    fold_scores = []
     
     # XGBoost parameters (optimized from original)
     xgb_params = {
@@ -412,8 +463,17 @@ def cross_validate_xgboost(X, y, groups, n_folds=N_FOLDS):
         'n_jobs': -1,
     }
     
-    for fold, (train_idx, val_idx) in enumerate(gkf.split(X_train, y_train, groups_array)):
-        print(f"\nFold {fold + 1}/{n_folds}:")
+    # Progress bar for folds
+    fold_pbar = tqdm(enumerate(gkf.split(X_train, y_train, groups_array)), 
+                     total=n_folds, desc="🔥 CV Folds", 
+                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
+    
+    for fold, (train_idx, val_idx) in fold_pbar:
+        # Skip completed folds
+        if fold < start_fold:
+            continue
+            
+        fold_pbar.set_description(f"🔥 Fold {fold + 1}/{n_folds}")
         
         # Split data
         X_fold_train = X_train[train_idx]
@@ -424,8 +484,9 @@ def cross_validate_xgboost(X, y, groups, n_folds=N_FOLDS):
         y_fold_val = y_train[val_idx]
         groups_fold_val = groups_train[val_idx]
         
-        print(f"  Train: {len(X_fold_train)} rows, {len(groups_fold_train.unique('ranker_id'))} groups")
-        print(f"  Val:   {len(X_fold_val)} rows, {len(groups_fold_val.unique('ranker_id'))} groups")
+        tqdm.write(f"\n📈 Fold {fold + 1}/{n_folds}:")
+        tqdm.write(f"   Train: {len(X_fold_train):,} rows, {len(groups_fold_train.unique('ranker_id')):,} groups")
+        tqdm.write(f"   Val:   {len(X_fold_val):,} rows, {len(groups_fold_val.unique('ranker_id')):,} groups")
         
         # Create XGBoost datasets
         group_sizes_train = groups_fold_train.group_by('ranker_id', maintain_order=True).agg(pl.len())['len'].to_numpy()
@@ -434,23 +495,22 @@ def cross_validate_xgboost(X, y, groups, n_folds=N_FOLDS):
         dtrain = xgb.DMatrix(X_fold_train, label=y_fold_train, group=group_sizes_train, feature_names=X_fold_train.columns)
         dval = xgb.DMatrix(X_fold_val, label=y_fold_val, group=group_sizes_val, feature_names=X_fold_val.columns)
         
-        # Train model
-        print("  Training XGBoost...")
-        rounds = 400 if USE_SUBSET else 600  # More rounds for full data
+        # Train model with progress tracking
+        tqdm.write("   🤖 Training XGBoost with enhanced features...")
+        rounds = 400 if USE_SUBSET else 600
+        
         model = xgb.train(
             xgb_params,
             dtrain,
             num_boost_round=rounds,
             evals=[(dtrain, 'train'), (dval, 'val')],
-            verbose_eval=0  # Suppress training output
+            verbose_eval=50  # Progress every 50 iterations as requested
         )
         
         # Make predictions
         val_preds = model.predict(dval)
         
         # CRITICAL: Calculate HitRate@3 with correct filtering
-        # This step filters validation set to only include groups with >10 options 
-        # BEFORE calculating the metric - exactly like competition evaluation
         fold_score = hitrate_at_3(
             y_fold_val.to_pandas()['selected'].values,
             val_preds, 
@@ -458,18 +518,39 @@ def cross_validate_xgboost(X, y, groups, n_folds=N_FOLDS):
         )
         
         fold_scores.append(fold_score)
-        print(f"  Fold {fold + 1} HitRate@3: {fold_score:.5f}")
+        tqdm.write(f"   ✅ Fold {fold + 1} HitRate@3: {fold_score:.5f}")
+        
+        # Save checkpoint after each fold
+        checkpoint_data = {
+            'completed_folds': list(range(fold + 1)),
+            'fold_scores': fold_scores,
+            'timestamp': datetime.now().isoformat(),
+            'n_folds': n_folds
+        }
+        with open(checkpoint_file, 'w') as f:
+            json.dump(checkpoint_data, f, indent=2)
+        tqdm.write(f"   💾 Checkpoint saved (Fold {fold + 1} complete)")
     
     cv_mean = np.mean(fold_scores)
     cv_std = np.std(fold_scores)
     
-    print(f"\n" + "="*50)
-    print(f"CORRECTED CROSS-VALIDATION RESULTS:")
-    print(f"Mean HitRate@3: {cv_mean:.5f} ± {cv_std:.5f}")
-    print(f"Individual folds: {[f'{score:.5f}' for score in fold_scores]}")
-    print(f"="*50)
-    print(f"Expected: This should be close to public LB score (~0.497)")
-    print(f"Previous inflated CV was ~0.588 - this should be much lower!")
+    print(f"\n" + "="*60)
+    print(f"🎯 ENHANCED CROSS-VALIDATION RESULTS (WITH NEW FEATURES):")
+    print(f"📊 Mean HitRate@3: {cv_mean:.5f} ± {cv_std:.5f}")
+    print(f"📈 Individual folds: {[f'{score:.5f}' for score in fold_scores]}")
+    print(f"🔥 NEW FEATURES ADDED:")
+    print(f"   ✅ booking_lead_time_hours")
+    print(f"   ✅ is_overnight_flight") 
+    print(f"   ✅ corporate_route_frequency")
+    print(f"   ✅ loyalty_match")
+    print(f"="*60)
+    print(f"🎯 BASELINE COMPARISON: Previous CV = 0.58139")
+    print(f"{'🚀 IMPROVEMENT!' if cv_mean < 0.58139 else '📉 Need more work'}: {cv_mean - 0.58139:+.5f}")
+    
+    # Clean up checkpoint file on successful completion
+    if os.path.exists(checkpoint_file):
+        os.remove(checkpoint_file)
+        print(f"🧹 Checkpoint file cleaned up")
     
     return cv_mean, cv_std, fold_scores
 
@@ -518,14 +599,15 @@ xgb_params_final = {
     'n_jobs': -1,
 }
 
-print("Training final model on 100% of data...")
+print("🚀 Training final enhanced model on 100% of data...")
 final_rounds = 600 if USE_SUBSET else 1000  # More rounds for full dataset
+
 final_model = xgb.train(
     xgb_params_final,
     dtrain_final,
     num_boost_round=final_rounds,
     evals=[(dtrain_final, 'train')],
-    verbose_eval=100
+    verbose_eval=100  # Progress every 100 iterations for final model
 )
 
 # Create models directory if it doesn't exist

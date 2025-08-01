@@ -132,9 +132,32 @@ df = df.with_columns([
         (pl.sum_horizontal(pl.col(col).is_not_null().cast(pl.UInt8) for col in mc_exists)
          if mc_exists else pl.lit(0)).alias("l0_seg"),
 
+        # ADVANCED FEATURE 1: Booking lead time in hours
+        (
+            pl.col("legs0_departureAt").str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S") - 
+            pl.col("requestDate")
+        ).dt.total_hours().alias("booking_lead_time_hours"),
+
+        # ADVANCED FEATURE 2: Overnight flight indicator
+        (
+            pl.col("legs0_departureAt").str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S").dt.date() !=
+            pl.col("legs0_arrivalAt").str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S").dt.date()
+        ).cast(pl.Int32).alias("is_overnight_flight"),
+
         # FF features
         (pl.col("frequentFlyer").fill_null("").str.count_matches("/") +
          (pl.col("frequentFlyer").fill_null("") != "").cast(pl.Int32)).alias("n_ff_programs"),
+
+        # ADVANCED FEATURE 4: Loyalty match (airline codes in FF matching marketing carrier)
+        pl.when(pl.col("frequentFlyer").is_not_null() & (pl.col("frequentFlyer") != ""))
+        .then(
+            pl.col("frequentFlyer").str.contains(
+                pl.col("legs0_segments0_marketingCarrier_code").fill_null("")
+            ).fill_null(False)
+        )
+        .otherwise(False)
+        .cast(pl.Int32)
+        .alias("loyalty_match"),
 
         # Binary features
         pl.col("corporateTariffCode").is_not_null().cast(pl.Int32).alias("has_corporate_tariff"),
@@ -260,9 +283,16 @@ df = (
         on='legs1_segments0_marketingCarrier_code',
         how='left'
     )
+    .join(
+        # ADVANCED FEATURE 3: Corporate route frequency
+        train.group_by(['companyID', 'searchRoute']).agg(pl.len().alias('corporate_route_frequency')),
+        on=['companyID', 'searchRoute'],
+        how='left'
+    )
     .with_columns([
         pl.col('carrier0_pop').fill_null(0.0),
         pl.col('carrier1_pop').fill_null(0.0),
+        pl.col('corporate_route_frequency').fill_null(1),  # Default to 1 for unseen company-route pairs
     ])
 )
 
